@@ -20,6 +20,7 @@
 import sigrokdecode as srd
 from common.srdhelper import bitpack
 from math import floor, ceil
+from .erica_encoder_decoder import DDR_ASCII
 
 '''
 OUTPUT_PYTHON format:
@@ -39,10 +40,7 @@ This is the list of <ptype>s and their respective <pdata> values:
  - 'INVALID STOPBIT': The data is the (integer) value of the stop bit (0/1).
  - 'PARITY ERROR': The data is a tuple with two entries. The first one is
    the expected parity value, the second is the actual parity value.
- - 'BREAK': The data is always 0.
- - 'FRAME': The data is always a tuple containing two items: The (integer)
-   value of the UART data, and a boolean which reflects the validity of the
-   UART frame.
+ - TODO: Frame error?
 
 The <rxtx> field is 0 for RX packets, 1 for TX packets.
 '''
@@ -80,13 +78,13 @@ class ChannelError(Exception):
 
 class Decoder(srd.Decoder):
     api_version = 3
-    id = 'uart'
-    name = 'UART'
-    longname = 'Universal Asynchronous Receiver/Transmitter'
-    desc = 'Asynchronous, serial bus.'
+    id = 'erika'
+    name = 'Erika'
+    longname = 'Erika Serial Interface'
+    desc = 'Erika Serial Interface'
     license = 'gplv2+'
     inputs = ['logic']
-    outputs = ['uart']
+    outputs = ['erika']
     optional_channels = (
         # Allow specifying only one of the signals, e.g. if only one data
         # direction exists (or is relevant).
@@ -94,7 +92,7 @@ class Decoder(srd.Decoder):
         {'id': 'tx', 'name': 'TX', 'desc': 'UART transmit line'},
     )
     options = (
-        {'id': 'baudrate', 'desc': 'Baud rate', 'default': 115200},
+        {'id': 'baudrate', 'desc': 'Baud rate', 'default': 1200},
         {'id': 'num_data_bits', 'desc': 'Data bits', 'default': 8,
             'values': (5, 6, 7, 8, 9)},
         {'id': 'parity_type', 'desc': 'Parity type', 'default': 'none',
@@ -127,18 +125,14 @@ class Decoder(srd.Decoder):
         ('tx-warnings', 'TX warnings'),
         ('rx-data-bits', 'RX data bits'),
         ('tx-data-bits', 'TX data bits'),
-        ('rx-break', 'RX break'),
-        ('tx-break', 'TX break'),
     )
     annotation_rows = (
         ('rx-data', 'RX', (0, 2, 4, 6, 8)),
         ('rx-data-bits', 'RX bits', (12,)),
         ('rx-warnings', 'RX warnings', (10,)),
-        ('rx-break', 'RX break', (14,)),
         ('tx-data', 'TX', (1, 3, 5, 7, 9)),
         ('tx-data-bits', 'TX bits', (13,)),
         ('tx-warnings', 'TX warnings', (11,)),
-        ('tx-break', 'TX break', (15,)),
     )
     binary = (
         ('rx', 'RX dump'),
@@ -163,12 +157,6 @@ class Decoder(srd.Decoder):
         s, halfbit = self.samplenum, self.bit_width / 2.0
         self.put(s - floor(halfbit), s + ceil(halfbit), self.out_python, data)
 
-    def putgse(self, ss, es, data):
-        self.put(ss, es, self.out_ann, data)
-
-    def putpse(self, ss, es, data):
-        self.put(ss, es, self.out_python, data)
-
     def putbin(self, rxtx, data):
         s, halfbit = self.startsample[rxtx], self.bit_width / 2.0
         self.put(s - floor(halfbit), self.samplenum + ceil(halfbit), self.out_binary, data)
@@ -180,7 +168,6 @@ class Decoder(srd.Decoder):
         self.samplerate = None
         self.samplenum = 0
         self.frame_start = [-1, -1]
-        self.frame_valid = [None, None]
         self.startbit = [-1, -1]
         self.cur_data_bit = [0, 0]
         self.datavalue = [0, 0]
@@ -189,7 +176,7 @@ class Decoder(srd.Decoder):
         self.startsample = [-1, -1]
         self.state = ['WAIT FOR START BIT', 'WAIT FOR START BIT']
         self.databits = [[], []]
-        self.break_start = [None, None]
+        self.ddr_ascii = DDR_ASCII()
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
@@ -217,7 +204,6 @@ class Decoder(srd.Decoder):
     def wait_for_start_bit(self, rxtx, signal):
         # Save the sample number where the start bit begins.
         self.frame_start[rxtx] = self.samplenum
-        self.frame_valid[rxtx] = True
 
         self.state[rxtx] = 'GET START BIT'
 
@@ -229,10 +215,6 @@ class Decoder(srd.Decoder):
         if self.startbit[rxtx] != 0:
             self.putp(['INVALID STARTBIT', rxtx, self.startbit[rxtx]])
             self.putg([rxtx + 10, ['Frame error', 'Frame err', 'FE']])
-            self.frame_valid[rxtx] = False
-            es = self.samplenum + ceil(self.bit_width / 2.0)
-            self.putpse(self.frame_start[rxtx], es, ['FRAME', rxtx,
-                (self.datavalue[rxtx], self.frame_valid[rxtx])])
             self.state[rxtx] = 'WAIT FOR START BIT'
             return
 
@@ -298,10 +280,11 @@ class Decoder(srd.Decoder):
         # "not ASCII" in its strict sense, 127 (DEL) is not printable,
         # fall back to hex representation for non-printables.
         if fmt == 'ascii':
-            if v in range(32, 126 + 1):
-                return chr(v)
-            hexfmt = "[{:02X}]" if bits <= 8 else "[{:03X}]"
-            return hexfmt.format(v)
+            return self.ddr_ascii.try_decode(hex(v).upper()[2:])
+            # if v in range(32, 126 + 1):
+            # 	pass
+            # hexfmt = "[{:02X}]" if bits <= 8 else "[{:03X}]"
+            # return hexfmt.format(v)
 
         # Mere number to text conversion without prefix and padding
         # for the "decimal" output format.
@@ -339,7 +322,6 @@ class Decoder(srd.Decoder):
             # TODO: Return expected/actual parity values.
             self.putp(['PARITY ERROR', rxtx, (0, 1)]) # FIXME: Dummy tuple...
             self.putg([rxtx + 6, ['Parity error', 'Parity err', 'PE']])
-            self.frame_valid[rxtx] = False
 
         self.state[rxtx] = 'GET STOP BITS'
 
@@ -351,23 +333,11 @@ class Decoder(srd.Decoder):
         if self.stopbit1[rxtx] != 1:
             self.putp(['INVALID STOPBIT', rxtx, self.stopbit1[rxtx]])
             self.putg([rxtx + 10, ['Frame error', 'Frame err', 'FE']])
-            self.frame_valid[rxtx] = False
+            # TODO: Abort? Ignore the frame? Other?
 
         self.putp(['STOPBIT', rxtx, self.stopbit1[rxtx]])
         self.putg([rxtx + 4, ['Stop bit', 'Stop', 'T']])
 
-        # Pass the complete UART frame to upper layers.
-        es = self.samplenum + ceil(self.bit_width / 2.0)
-        self.putpse(self.frame_start[rxtx], es, ['FRAME', rxtx,
-            (self.datavalue[rxtx], self.frame_valid[rxtx])])
-
-        self.state[rxtx] = 'WAIT FOR START BIT'
-
-    def handle_break(self, rxtx):
-        self.putpse(self.frame_start[rxtx], self.samplenum,
-                ['BREAK', rxtx, 0])
-        self.putgse(self.frame_start[rxtx], self.samplenum,
-                [rxtx + 14, ['Break condition', 'Break', 'Brk', 'B']])
         self.state[rxtx] = 'WAIT FOR START BIT'
 
     def get_wait_cond(self, rxtx, inv):
@@ -406,22 +376,6 @@ class Decoder(srd.Decoder):
         elif state == 'GET STOP BITS':
             self.get_stop_bits(rxtx, signal)
 
-    def inspect_edge(self, rxtx, signal, inv):
-        # Inspect edges, independently from traffic, to detect break conditions.
-        if inv:
-            signal = not signal
-        if not signal:
-            # Signal went low. Start another interval.
-            self.break_start[rxtx] = self.samplenum
-            return
-        # Signal went high. Was there an extended period with low signal?
-        if self.break_start[rxtx] is None:
-            return
-        diff = self.samplenum - self.break_start[rxtx]
-        if diff >= self.break_min_sample_count:
-            self.handle_break(rxtx)
-        self.break_start[rxtx] = None
-
     def decode(self):
         if not self.samplerate:
             raise SamplerateError('Cannot decode without samplerate.')
@@ -432,36 +386,18 @@ class Decoder(srd.Decoder):
 
         opt = self.options
         inv = [opt['invert_rx'] == 'yes', opt['invert_tx'] == 'yes']
-        cond_data_idx = [None] * len(has_pin)
-
-        # Determine the number of samples for a complete frame's time span.
-        # A period of low signal (at least) that long is a break condition.
-        frame_samples = 1 # START
-        frame_samples += self.options['num_data_bits']
-        frame_samples += 0 if self.options['parity_type'] == 'none' else 1
-        frame_samples += self.options['num_stop_bits']
-        frame_samples *= self.bit_width
-        self.break_min_sample_count = ceil(frame_samples)
-        cond_edge_idx = [None] * len(has_pin)
+        cond_idx = [None] * len(has_pin)
 
         while True:
             conds = []
             if has_pin[RX]:
-                cond_data_idx[RX] = len(conds)
+                cond_idx[RX] = len(conds)
                 conds.append(self.get_wait_cond(RX, inv[RX]))
-                cond_edge_idx[RX] = len(conds)
-                conds.append({RX: 'e'})
             if has_pin[TX]:
-                cond_data_idx[TX] = len(conds)
+                cond_idx[TX] = len(conds)
                 conds.append(self.get_wait_cond(TX, inv[TX]))
-                cond_edge_idx[TX] = len(conds)
-                conds.append({TX: 'e'})
             (rx, tx) = self.wait(conds)
-            if cond_data_idx[RX] is not None and self.matched[cond_data_idx[RX]]:
+            if cond_idx[RX] is not None and self.matched[cond_idx[RX]]:
                 self.inspect_sample(RX, rx, inv[RX])
-            if cond_edge_idx[RX] is not None and self.matched[cond_edge_idx[RX]]:
-                self.inspect_edge(RX, rx, inv[RX])
-            if cond_data_idx[TX] is not None and self.matched[cond_data_idx[TX]]:
+            if cond_idx[TX] is not None and self.matched[cond_idx[TX]]:
                 self.inspect_sample(TX, tx, inv[TX])
-            if cond_edge_idx[TX] is not None and self.matched[cond_edge_idx[TX]]:
-                self.inspect_edge(TX, tx, inv[TX])
